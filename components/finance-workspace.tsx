@@ -6,6 +6,7 @@ import {
   ArrowLeftRight,
   ArrowUpRight,
   Bell,
+  CalendarClock,
   CalendarDays,
   ChartNoAxesCombined,
   CheckCircle2,
@@ -17,6 +18,8 @@ import {
   LayoutDashboard,
   LogOut,
   Menu,
+  MonitorCog,
+  MoreHorizontal,
   Pencil,
   PiggyBank,
   Plus,
@@ -32,7 +35,7 @@ import {
   WalletCards,
   X,
 } from 'lucide-react';
-import { useEffect, useRef, useState } from 'react';
+import { createContext, useContext, useEffect, useRef, useState } from 'react';
 import {
   Area,
   AreaChart,
@@ -49,6 +52,8 @@ import {
 } from 'recharts';
 
 import { chatGPTSignOutPath } from '@/app/chatgpt-auth';
+import { AttachmentComposer } from '@/components/attachment-composer';
+import { PlanningView } from '@/components/planning-view';
 import {
   AlertDialog,
   AlertDialogAction,
@@ -83,18 +88,42 @@ import { Progress } from '@/components/ui/progress';
 import {
   emptyFinanceData,
   makeDemoFinanceData,
+  type Account,
+  type Attachment,
   type Budget,
+  type CardStatement,
   type Category,
+  type CurrencyCode,
   type FinanceData,
   type Goal,
+  type RecurrenceRule,
   type Transaction,
   type TransactionKind,
   type TransactionStatus,
 } from '@/lib/finance';
+import {
+  advanceRecurrenceDate,
+  cardCycleForPurchase,
+  type RecurrenceFrequency,
+} from '@/lib/finance-rules';
+import {
+  buildImportPreview,
+  readTransactionImportFile,
+  type ImportPreview,
+  type ImportSource,
+} from '@/lib/import-transactions';
+import {
+  deleteLocalAttachment,
+  getLocalAttachment,
+  loadLocalFinanceData,
+  saveLocalAttachment,
+  saveLocalFinanceData,
+} from '@/lib/local-preview';
 
 export type WorkspaceView =
   | 'dashboard'
   | 'transactions'
+  | 'planning'
   | 'budgets'
   | 'goals'
   | 'reports'
@@ -119,13 +148,8 @@ type TransactionDraft = {
   paymentMethodId: string;
   responsible: string;
   notes: string;
-};
-
-type ImportPreview = {
-  sourceName: string;
-  rows: Transaction[];
-  invalidCount: number;
-  duplicateCount: number;
+  recurrenceFrequency: '' | RecurrenceFrequency;
+  recurrenceEndDate: string;
 };
 
 const navItems: Array<{
@@ -146,6 +170,12 @@ const navItems: Array<{
     href: '/transactions',
     icon: ReceiptText,
   },
+  {
+    view: 'planning',
+    label: 'Planejamento',
+    href: '/planning',
+    icon: CalendarClock,
+  },
   { view: 'budgets', label: 'Orçamentos', href: '/budgets', icon: WalletCards },
   { view: 'goals', label: 'Metas', href: '/goals', icon: Target },
   {
@@ -162,6 +192,13 @@ const navItems: Array<{
   },
 ];
 
+const mobileNavLabels: Partial<Record<WorkspaceView, string>> = {
+  dashboard: 'Visão',
+  transactions: 'Lançamentos',
+  planning: 'Planejar',
+  budgets: 'Limites',
+};
+
 const viewCopy: Record<
   WorkspaceView,
   { eyebrow: string; title: string; description: string }
@@ -177,6 +214,12 @@ const viewCopy: Record<
     title: 'Todos os lançamentos',
     description:
       'Encontre, ajuste e confirme movimentações em poucos segundos.',
+  },
+  planning: {
+    eyebrow: 'Próximos ciclos',
+    title: 'Cartões e recorrências',
+    description:
+      'Planeje faturas e gere lançamentos recorrentes somente quando decidir.',
   },
   budgets: {
     eyebrow: 'Limites conscientes',
@@ -240,13 +283,17 @@ function shortMonth(month: string) {
   );
 }
 
-function formatMoney(cents: number, compact = false) {
-  return new Intl.NumberFormat('pt-BR', {
-    style: 'currency',
-    currency: 'BRL',
-    notation: compact ? 'compact' : 'standard',
-    maximumFractionDigits: compact ? 1 : 2,
-  }).format(cents / 100);
+const CurrencyContext = createContext<CurrencyCode>('EUR');
+
+function useMoneyFormatter() {
+  const currency = useContext(CurrencyContext);
+  return (cents: number, compact = false) =>
+    new Intl.NumberFormat(currency === 'EUR' ? 'pt-PT' : 'pt-BR', {
+      style: 'currency',
+      currency,
+      notation: compact ? 'compact' : 'standard',
+      maximumFractionDigits: compact ? 1 : 2,
+    }).format(cents / 100);
 }
 
 function parseMoney(value: string) {
@@ -282,6 +329,8 @@ function blankTransaction(month: string, data: FinanceData): TransactionDraft {
     paymentMethodId: data.paymentMethods[0]?.id ?? '',
     responsible: '',
     notes: '',
+    recurrenceFrequency: '',
+    recurrenceEndDate: '',
   };
 }
 
@@ -299,6 +348,8 @@ function transactionToDraft(transaction: Transaction): TransactionDraft {
     paymentMethodId: transaction.paymentMethodId ?? '',
     responsible: transaction.responsible ?? '',
     notes: transaction.notes ?? '',
+    recurrenceFrequency: '',
+    recurrenceEndDate: '',
   };
 }
 
@@ -310,32 +361,21 @@ function normalizeText(value: string) {
     .toLowerCase();
 }
 
-function splitCsvLine(line: string, separator: string) {
-  const cells: string[] = [];
-  let cell = '';
-  let quoted = false;
-  for (let index = 0; index < line.length; index += 1) {
-    const character = line[index];
-    if (character === '"') {
-      if (quoted && line[index + 1] === '"') {
-        cell += '"';
-        index += 1;
-      } else {
-        quoted = !quoted;
-      }
-    } else if (character === separator && !quoted) {
-      cells.push(cell.trim());
-      cell = '';
-    } else {
-      cell += character;
-    }
-  }
-  cells.push(cell.trim());
-  return cells;
-}
-
 function exportCsv(data: FinanceData) {
-  const header = ['data', 'grupo', 'descricao', 'valor', 'status', 'categoria'];
+  const header = [
+    'data',
+    'grupo',
+    'descricao',
+    'valor',
+    'moeda',
+    'status',
+    'categoria',
+  ];
+  const safeCsvCell = (value: unknown) => {
+    let text = String(value);
+    if (/^[\t\r\n ]*[=+\-@]/.test(text)) text = `'${text}`;
+    return `"${text.replace(/"/g, '""')}"`;
+  };
   const lines = data.transactions.map((item) => {
     const category =
       data.categories.find((entry) => entry.id === item.categoryId)?.name ?? '';
@@ -344,10 +384,11 @@ function exportCsv(data: FinanceData) {
       kindLabels[item.kind],
       item.title,
       (item.amountCents / 100).toFixed(2).replace('.', ','),
+      data.currency,
       item.status === 'paid' ? 'Pago' : 'Pendente',
       category,
     ]
-      .map((value) => `"${String(value).replace(/"/g, '""')}"`)
+      .map(safeCsvCell)
       .join(';');
   });
   const blob = new Blob([`\ufeff${[header.join(';'), ...lines].join('\n')}`], {
@@ -359,6 +400,82 @@ function exportCsv(data: FinanceData) {
   anchor.download = `nexocasa-${new Date().toISOString().slice(0, 10)}.csv`;
   anchor.click();
   URL.revokeObjectURL(href);
+}
+
+function assignLocalCardStatement(
+  data: FinanceData,
+  transaction: Transaction,
+): { transaction: Transaction; statement: CardStatement | null } {
+  const previous = data.transactions.find((item) => item.id === transaction.id);
+  const previousStatement = previous?.cardStatementId
+    ? data.cardStatements.find((item) => item.id === previous.cardStatementId)
+    : null;
+  if (previousStatement && previousStatement.status !== 'open') {
+    throw new Error('A fatura está fechada e protege este lançamento.');
+  }
+
+  if (transaction.kind !== 'expense' || !transaction.accountId) {
+    return {
+      transaction: { ...transaction, cardStatementId: null },
+      statement: null,
+    };
+  }
+  const account = data.accounts.find(
+    (item) => item.id === transaction.accountId,
+  );
+  if (account?.type !== 'credit') {
+    return {
+      transaction: { ...transaction, cardStatementId: null },
+      statement: null,
+    };
+  }
+  if (!account.closingDay || !account.dueDay) {
+    throw new Error('Complete o fechamento e o vencimento do cartão.');
+  }
+
+  const cycle = cardCycleForPurchase(
+    transaction.date,
+    account.closingDay,
+    account.dueDay,
+  );
+  const existing = data.cardStatements.find(
+    (item) =>
+      item.cardAccountId === account.id && item.cycleEnd === cycle.cycleEnd,
+  );
+  if (existing && existing.status !== 'open') {
+    throw new Error('A fatura desse período já está fechada.');
+  }
+  const statement: CardStatement = existing ?? {
+    id: `local-statement-${account.id}-${cycle.cycleEnd}`,
+    cardAccountId: account.id,
+    cycleStart: cycle.cycleStart,
+    cycleEnd: cycle.cycleEnd,
+    dueDate: cycle.dueDate,
+    status: 'open',
+    closedTotalCents: null,
+  };
+
+  return {
+    transaction: { ...transaction, cardStatementId: statement.id },
+    statement,
+  };
+}
+
+function attachmentKind(file: File): Attachment['kind'] {
+  if (file.type.startsWith('audio/')) return 'audio';
+  if (file.type.startsWith('image/') || file.type === 'application/pdf') {
+    return 'receipt';
+  }
+  return 'other';
+}
+
+function downloadBlob(blob: Blob, fileName: string) {
+  const href = URL.createObjectURL(blob);
+  const anchor = document.createElement('a');
+  anchor.href = href;
+  anchor.download = fileName;
+  anchor.click();
+  window.setTimeout(() => URL.revokeObjectURL(href), 0);
 }
 
 async function loadFinanceData() {
@@ -391,14 +508,13 @@ export function FinanceWorkspace({
   const [goalOpen, setGoalOpen] = useState(false);
   const [categoryOpen, setCategoryOpen] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<Transaction | null>(null);
+  const [pendingFiles, setPendingFiles] = useState<File[]>([]);
+  const [importSource, setImportSource] = useState<ImportSource | null>(null);
   const [importPreview, setImportPreview] = useState<ImportPreview | null>(
     null,
   );
-  const [notice, setNotice] = useState<string | null>(
-    isLocalPreview
-      ? 'Modo de demonstração: os valores abaixo são fictícios.'
-      : null,
-  );
+  const [localReady, setLocalReady] = useState(!isLocalPreview);
+  const [notice, setNotice] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   async function refreshData() {
@@ -412,6 +528,22 @@ export function FinanceWorkspace({
       );
     }
   }
+
+  useEffect(() => {
+    if (!isLocalPreview) return;
+    const timer = window.setTimeout(() => {
+      const fallback = makeDemoFinanceData();
+      setData(loadLocalFinanceData(fallback));
+      setLocalReady(true);
+      setLoading(false);
+    }, 0);
+    return () => window.clearTimeout(timer);
+  }, [isLocalPreview]);
+
+  useEffect(() => {
+    if (!isLocalPreview || !localReady) return;
+    saveLocalFinanceData(data);
+  }, [data, isLocalPreview, localReady]);
 
   useEffect(() => {
     if (isLocalPreview) return;
@@ -505,7 +637,7 @@ export function FinanceWorkspace({
         const expectedOut = total('expense') + total('investment');
         return {
           month: selectedMonth,
-          currency: 'BRL',
+          currency: data.currency,
           realized: {
             incomeCents: realizedIncome,
             outflowCents: realizedOut,
@@ -603,7 +735,7 @@ export function FinanceWorkspace({
           status: 'created',
           date: transaction.date,
           amountCents: transaction.amountCents,
-          currency: 'BRL',
+          currency: data.currency,
         };
       },
     });
@@ -637,11 +769,13 @@ export function FinanceWorkspace({
         (item) => item.kind === (kind === 'transfer' ? 'expense' : kind),
       )?.id ?? '';
     setTransactionDraft(draft);
+    setPendingFiles([]);
     setTransactionOpen(true);
   }
 
   function openEditTransaction(transaction: Transaction) {
     setTransactionDraft(transactionToDraft(transaction));
+    setPendingFiles([]);
     setTransactionOpen(true);
   }
 
@@ -661,8 +795,28 @@ export function FinanceWorkspace({
       setNotice('Escolha contas de origem e destino diferentes.');
       return;
     }
+    if (
+      transactionDraft.recurrenceFrequency &&
+      transactionDraft.recurrenceEndDate &&
+      transactionDraft.recurrenceEndDate <= transactionDraft.date
+    ) {
+      setNotice('O término da recorrência deve ser posterior à primeira data.');
+      return;
+    }
 
-    const transaction: Transaction = {
+    const selectedAccount = data.accounts.find(
+      (item) => item.id === transactionDraft.accountId,
+    );
+    if (
+      selectedAccount?.type === 'credit' &&
+      transactionDraft.kind !== 'expense'
+    ) {
+      setNotice('Use o cartão somente em lançamentos do tipo despesa.');
+      return;
+    }
+
+    const isNew = !transactionDraft.id;
+    let transaction: Transaction = {
       id: transactionDraft.id ?? newId('tx'),
       kind: transactionDraft.kind,
       title: transactionDraft.title.trim(),
@@ -683,28 +837,140 @@ export function FinanceWorkspace({
       notes: transactionDraft.notes.trim() || null,
     };
 
+    let statement: CardStatement | null = null;
+    let recurrence: RecurrenceRule | null = null;
+    const uploadedAttachments: Attachment[] = [];
     try {
-      await postAction({ action: 'save-transaction', ...transaction });
-      setData((current) => ({
-        ...current,
-        transactions: current.transactions.some(
-          (item) => item.id === transaction.id,
-        )
-          ? current.transactions.map((item) =>
-              item.id === transaction.id ? transaction : item,
-            )
-          : [transaction, ...current.transactions],
-      }));
+      if (isLocalPreview) {
+        setSaving(true);
+        const assignment = assignLocalCardStatement(data, transaction);
+        transaction = assignment.transaction;
+        statement = assignment.statement;
+      } else {
+        const result = (await postAction({
+          action: 'save-transaction',
+          ...transaction,
+        })) as { cardStatementId?: string | null };
+        transaction = {
+          ...transaction,
+          cardStatementId: result.cardStatementId ?? null,
+        };
+      }
+
+      if (isNew && transactionDraft.recurrenceFrequency) {
+        const frequency = transactionDraft.recurrenceFrequency;
+        const nextDate = advanceRecurrenceDate(
+          transaction.date,
+          frequency,
+          1,
+          transaction.date,
+        );
+        if (isLocalPreview) {
+          recurrence = {
+            id: newId('recurrence'),
+            sourceTransactionId: transaction.id,
+            frequency,
+            interval: 1,
+            anchorDate: transaction.date,
+            nextDate,
+            endDate: transactionDraft.recurrenceEndDate || null,
+            occurrenceStatus: 'pending',
+            active: true,
+          };
+          transaction = {
+            ...transaction,
+            recurrenceId: recurrence.id,
+            recurrenceOccurrenceDate: transaction.date,
+          };
+        } else {
+          const result = (await postAction({
+            action: 'save-recurrence',
+            sourceTransactionId: transaction.id,
+            frequency,
+            interval: 1,
+            endDate: transactionDraft.recurrenceEndDate || null,
+          })) as { id: string; nextDate: string; anchorDate: string };
+          transaction = {
+            ...transaction,
+            recurrenceId: result.id,
+            recurrenceOccurrenceDate: transaction.date,
+          };
+        }
+      }
+
+      if (pendingFiles.length) setSaving(true);
+      for (const file of pendingFiles) {
+        if (isLocalPreview) {
+          const id = newId('attachment');
+          await saveLocalAttachment(id, file);
+          uploadedAttachments.push({
+            id,
+            transactionId: transaction.id,
+            fileName: file.name,
+            contentType: file.type,
+            sizeBytes: file.size,
+            kind: attachmentKind(file),
+            status: 'ready',
+            createdAt: new Date().toISOString(),
+          });
+        } else {
+          const form = new FormData();
+          form.set('transactionId', transaction.id);
+          form.set('file', file);
+          const response = await fetch('/api/attachments', {
+            method: 'POST',
+            body: form,
+          });
+          const payload = (await response.json()) as Attachment & {
+            error?: string;
+          };
+          if (!response.ok) {
+            throw new Error(
+              payload.error ?? 'Não foi possível guardar um comprovante.',
+            );
+          }
+          uploadedAttachments.push(payload);
+        }
+      }
+
+      if (isLocalPreview) {
+        setData((current) => ({
+          ...current,
+          transactions: current.transactions.some(
+            (item) => item.id === transaction.id,
+          )
+            ? current.transactions.map((item) =>
+                item.id === transaction.id ? transaction : item,
+              )
+            : [transaction, ...current.transactions],
+          recurrenceRules: recurrence
+            ? [...current.recurrenceRules, recurrence]
+            : current.recurrenceRules,
+          cardStatements:
+            statement &&
+            !current.cardStatements.some((item) => item.id === statement?.id)
+              ? [statement, ...current.cardStatements]
+              : current.cardStatements,
+          attachments: [...uploadedAttachments, ...current.attachments],
+        }));
+      } else {
+        await refreshData();
+      }
       setTransactionOpen(false);
+      setPendingFiles([]);
       setNotice(
-        transactionDraft.id
+        !isNew
           ? 'Lançamento atualizado.'
-          : 'Lançamento adicionado.',
+          : transactionDraft.recurrenceFrequency
+            ? 'Lançamento e recorrência adicionados.'
+            : 'Lançamento adicionado.',
       );
     } catch (error) {
       setNotice(
         error instanceof Error ? error.message : 'Não foi possível salvar.',
       );
+    } finally {
+      setSaving(false);
     }
   }
 
@@ -712,6 +978,14 @@ export function FinanceWorkspace({
     const status: TransactionStatus =
       transaction.status === 'paid' ? 'pending' : 'paid';
     try {
+      const statement = transaction.cardStatementId
+        ? data.cardStatements.find(
+            (item) => item.id === transaction.cardStatementId,
+          )
+        : null;
+      if (isLocalPreview && statement && statement.status !== 'open') {
+        throw new Error('A fatura está fechada e protege este lançamento.');
+      }
       await postAction({ action: 'toggle-status', id: transaction.id, status });
       setData((current) => ({
         ...current,
@@ -732,11 +1006,33 @@ export function FinanceWorkspace({
   async function deleteTransaction() {
     if (!deleteTarget) return;
     try {
+      const relatedAttachments = data.attachments.filter(
+        (item) => item.transactionId === deleteTarget.id,
+      );
+      if (isLocalPreview) {
+        const statement = deleteTarget.cardStatementId
+          ? data.cardStatements.find(
+              (item) => item.id === deleteTarget.cardStatementId,
+            )
+          : null;
+        if (statement && statement.status !== 'open') {
+          throw new Error('A fatura está fechada e protege este lançamento.');
+        }
+        await Promise.all(
+          relatedAttachments.map((item) => deleteLocalAttachment(item.id)),
+        );
+      }
       await postAction({ action: 'delete-transaction', id: deleteTarget.id });
       setData((current) => ({
         ...current,
         transactions: current.transactions.filter(
           (item) => item.id !== deleteTarget.id,
+        ),
+        recurrenceRules: current.recurrenceRules.filter(
+          (item) => item.sourceTransactionId !== deleteTarget.id,
+        ),
+        attachments: current.attachments.filter(
+          (item) => item.transactionId !== deleteTarget.id,
         ),
       }));
       setDeleteTarget(null);
@@ -834,96 +1130,25 @@ export function FinanceWorkspace({
   }
 
   async function readImport(file: File) {
-    const text = await file.text();
-    const lines = text.split(/\r?\n/).filter((line) => line.trim());
-    if (lines.length < 2) {
-      setNotice('O arquivo não contém linhas para importar.');
-      return;
-    }
-    const separator = lines[0].includes(';') ? ';' : ',';
-    const parseLine = (line: string) => splitCsvLine(line, separator);
-    const headers = parseLine(lines[0]).map(normalizeText);
-    const findIndex = (...names: string[]) =>
-      headers.findIndex((item) => names.includes(item));
-    const dateIndex = findIndex('data', 'date');
-    const kindIndex = findIndex('grupo', 'tipo', 'kind');
-    const titleIndex = findIndex(
-      'descricao',
-      'descrição',
-      'titulo',
-      'título',
-      'title',
-    );
-    const amountIndex = findIndex('valor', 'amount');
-    const statusIndex = findIndex('status', 'situacao', 'situação');
-    const categoryIndex = findIndex('categoria', 'category');
-    const rows: Transaction[] = [];
-    let invalidCount = 0;
-    let duplicateCount = 0;
-    const seen = new Set(
-      data.transactions.map((item) =>
-        normalizeText(
-          `${item.date}|${item.kind}|${item.title}|${item.amountCents}`,
-        ),
-      ),
-    );
-
-    for (const line of lines.slice(1, 1001)) {
-      const cells = parseLine(line);
-      const rawKind = normalizeText(cells[kindIndex] ?? '');
-      const kind: TransactionKind =
-        rawKind.includes('entrada') || rawKind.includes('receita')
-          ? 'income'
-          : rawKind.includes('invest')
-            ? 'investment'
-            : rawKind.includes('transfer')
-              ? 'transfer'
-              : 'expense';
-      const rawDate = cells[dateIndex] ?? '';
-      const brazilianDate = /^(\d{2})\/(\d{2})\/(\d{4})$/.exec(rawDate);
-      const date = brazilianDate
-        ? `${brazilianDate[3]}-${brazilianDate[2]}-${brazilianDate[1]}`
-        : rawDate.slice(0, 10);
-      const title = (cells[titleIndex] ?? '').trim();
-      const amountCents = parseMoney(cells[amountIndex] ?? '');
-      if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || !title || amountCents <= 0) {
-        invalidCount += 1;
-        continue;
-      }
-      const fingerprint = normalizeText(
-        `${date}|${kind}|${title}|${amountCents}`,
+    try {
+      const source = await readTransactionImportFile(file);
+      const preview = buildImportPreview(source, 0, data);
+      setImportSource(source);
+      setImportPreview(preview);
+    } catch (error) {
+      setNotice(
+        error instanceof Error
+          ? error.message
+          : 'Não foi possível ler o arquivo.',
       );
-      if (seen.has(fingerprint)) {
-        duplicateCount += 1;
-        continue;
-      }
-      seen.add(fingerprint);
-      const categoryName = normalizeText(cells[categoryIndex] ?? '');
-      const categoryId = data.categories.find(
-        (item) =>
-          item.kind === kind && normalizeText(item.name) === categoryName,
-      )?.id;
-      rows.push({
-        id: newId('import'),
-        kind,
-        title,
-        amountCents,
-        date,
-        status: normalizeText(cells[statusIndex] ?? '').includes('pend')
-          ? 'pending'
-          : 'paid',
-        categoryId: categoryId ?? null,
-        accountId: data.accounts[0]?.id ?? null,
-        paymentMethodId: data.paymentMethods[0]?.id ?? null,
-      });
+    } finally {
+      if (fileInputRef.current) fileInputRef.current.value = '';
     }
-    setImportPreview({
-      sourceName: file.name,
-      rows,
-      invalidCount,
-      duplicateCount,
-    });
-    if (fileInputRef.current) fileInputRef.current.value = '';
+  }
+
+  function selectImportSheet(sheetIndex: number) {
+    if (!importSource) return;
+    setImportPreview(buildImportPreview(importSource, sheetIndex, data));
   }
 
   async function confirmImport() {
@@ -944,9 +1169,363 @@ export function FinanceWorkspace({
       }
       setNotice(`${importPreview.rows.length} lançamento(s) importado(s).`);
       setImportPreview(null);
+      setImportSource(null);
     } catch (error) {
       setNotice(
         error instanceof Error ? error.message : 'Não foi possível importar.',
+      );
+    }
+  }
+
+  async function changeCurrency(currency: CurrencyCode) {
+    if (currency === data.currency) return;
+    try {
+      if (isLocalPreview) setSaving(true);
+      await postAction({ action: 'set-currency', currency });
+      if (isLocalPreview) {
+        setData((current) => ({
+          ...current,
+          currency,
+          accounts: current.accounts.map((account) => ({
+            ...account,
+            currency,
+          })),
+        }));
+      } else {
+        await refreshData();
+      }
+      setNotice(
+        `Moeda-base alterada para ${currency}. Os valores não foram convertidos.`,
+      );
+    } catch (error) {
+      setNotice(
+        error instanceof Error
+          ? error.message
+          : 'Não foi possível alterar a moeda.',
+      );
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function saveCreditCard(card: Account) {
+    try {
+      if (isLocalPreview) {
+        setSaving(true);
+        setData((current) => ({
+          ...current,
+          accounts: current.accounts.some((item) => item.id === card.id)
+            ? current.accounts.map((item) =>
+                item.id === card.id ? card : item,
+              )
+            : [...current.accounts, card],
+        }));
+      } else {
+        await postAction({ action: 'save-credit-card', ...card });
+        await refreshData();
+      }
+      setNotice('Cartão salvo.');
+    } catch (error) {
+      setNotice(
+        error instanceof Error
+          ? error.message
+          : 'Não foi possível salvar o cartão.',
+      );
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function closeCardStatement(statement: CardStatement) {
+    try {
+      if (isLocalPreview) {
+        setSaving(true);
+        if (statement.status !== 'open') {
+          throw new Error('Somente faturas abertas podem ser fechadas.');
+        }
+        const closedTotalCents = data.transactions
+          .filter(
+            (item) =>
+              item.cardStatementId === statement.id && item.kind !== 'transfer',
+          )
+          .reduce((sum, item) => sum + item.amountCents, 0);
+        if (closedTotalCents <= 0) {
+          throw new Error('Não há compras para fechar nesta fatura.');
+        }
+        setData((current) => ({
+          ...current,
+          cardStatements: current.cardStatements.map((item) =>
+            item.id === statement.id
+              ? { ...item, status: 'closed', closedTotalCents }
+              : item,
+          ),
+        }));
+      } else {
+        await postAction({ action: 'close-card-statement', id: statement.id });
+        await refreshData();
+      }
+      setNotice('Fatura fechada com o total calculado pelas compras.');
+    } catch (error) {
+      setNotice(
+        error instanceof Error
+          ? error.message
+          : 'Não foi possível fechar a fatura.',
+      );
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function payCardStatement(
+    statement: CardStatement,
+    sourceAccountId: string,
+  ) {
+    try {
+      if (isLocalPreview) {
+        setSaving(true);
+        const source = data.accounts.find(
+          (item) => item.id === sourceAccountId,
+        );
+        const card = data.accounts.find(
+          (item) => item.id === statement.cardAccountId,
+        );
+        const total = statement.closedTotalCents ?? 0;
+        if (!source || source.type === 'credit') {
+          throw new Error('Escolha uma conta bancária para pagar a fatura.');
+        }
+        if (statement.status !== 'closed' || total <= 0) {
+          throw new Error('Feche a fatura antes de pagar.');
+        }
+        const payment: Transaction = {
+          id: `statement-payment-${statement.id}`,
+          kind: 'transfer',
+          title: `Pagamento · ${card?.name ?? 'cartão'}`,
+          amountCents: total,
+          date: statement.dueDate,
+          status: 'paid',
+          categoryId: null,
+          accountId: sourceAccountId,
+          destinationAccountId: statement.cardAccountId,
+          paymentMethodId: null,
+          cardStatementId: statement.id,
+        };
+        setData((current) => ({
+          ...current,
+          transactions: current.transactions.some(
+            (item) => item.id === payment.id,
+          )
+            ? current.transactions
+            : [payment, ...current.transactions],
+          cardStatements: current.cardStatements.map((item) =>
+            item.id === statement.id ? { ...item, status: 'paid' } : item,
+          ),
+        }));
+      } else {
+        await postAction({
+          action: 'pay-card-statement',
+          id: statement.id,
+          sourceAccountId,
+        });
+        await refreshData();
+      }
+      setNotice('Fatura paga como transferência, sem duplicar despesas.');
+    } catch (error) {
+      setNotice(
+        error instanceof Error
+          ? error.message
+          : 'Não foi possível pagar a fatura.',
+      );
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function toggleRecurrence(rule: RecurrenceRule) {
+    const active = !rule.active;
+    try {
+      if (isLocalPreview) setSaving(true);
+      await postAction({
+        action: 'set-recurrence-active',
+        id: rule.id,
+        active,
+      });
+      if (isLocalPreview) {
+        setData((current) => ({
+          ...current,
+          recurrenceRules: current.recurrenceRules.map((item) =>
+            item.id === rule.id ? { ...item, active } : item,
+          ),
+        }));
+      } else {
+        await refreshData();
+      }
+      setNotice(active ? 'Recorrência reativada.' : 'Recorrência pausada.');
+    } catch (error) {
+      setNotice(
+        error instanceof Error
+          ? error.message
+          : 'Não foi possível atualizar a recorrência.',
+      );
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function generateRecurrences(
+    ruleId: string | null,
+    throughDate: string,
+  ) {
+    try {
+      if (!isLocalPreview) {
+        const result = (await postAction({
+          action: 'materialize-recurrences',
+          ruleId,
+          throughDate,
+        })) as { generated?: number };
+        await refreshData();
+        setNotice(
+          `${result.generated ?? 0} lançamento(s) recorrente(s) gerado(s).`,
+        );
+        return;
+      }
+
+      setSaving(true);
+      let transactions = [...data.transactions];
+      let cardStatements = [...data.cardStatements];
+      let generated = 0;
+      const nextRules = data.recurrenceRules.map((rule) => {
+        if (!rule.active || (ruleId && rule.id !== ruleId)) return rule;
+        const source = transactions.find(
+          (item) => item.id === rule.sourceTransactionId,
+        );
+        if (!source) return { ...rule, active: false };
+
+        let occurrenceDate = rule.nextDate;
+        let iterations = 0;
+        while (
+          occurrenceDate <= throughDate &&
+          (!rule.endDate || occurrenceDate <= rule.endDate) &&
+          generated < 36 &&
+          iterations < 36
+        ) {
+          const exists = transactions.some(
+            (item) =>
+              item.recurrenceId === rule.id &&
+              item.recurrenceOccurrenceDate === occurrenceDate,
+          );
+          if (!exists) {
+            let occurrence: Transaction = {
+              ...source,
+              id: newId('tx'),
+              date: occurrenceDate,
+              status: rule.occurrenceStatus,
+              recurrenceId: rule.id,
+              recurrenceOccurrenceDate: occurrenceDate,
+              cardStatementId: null,
+            };
+            const assignment = assignLocalCardStatement(
+              { ...data, transactions, cardStatements },
+              occurrence,
+            );
+            occurrence = assignment.transaction;
+            if (
+              assignment.statement &&
+              !cardStatements.some(
+                (item) => item.id === assignment.statement?.id,
+              )
+            ) {
+              cardStatements = [assignment.statement, ...cardStatements];
+            }
+            transactions = [occurrence, ...transactions];
+            generated += 1;
+          }
+          occurrenceDate = advanceRecurrenceDate(
+            occurrenceDate,
+            rule.frequency,
+            rule.interval,
+            rule.anchorDate,
+          );
+          iterations += 1;
+        }
+        return {
+          ...rule,
+          nextDate: occurrenceDate,
+          active:
+            rule.endDate && occurrenceDate > rule.endDate ? false : rule.active,
+        };
+      });
+      setData((current) => ({
+        ...current,
+        transactions,
+        cardStatements,
+        recurrenceRules: nextRules,
+      }));
+      setNotice(`${generated} lançamento(s) recorrente(s) gerado(s).`);
+    } catch (error) {
+      setNotice(
+        error instanceof Error
+          ? error.message
+          : 'Não foi possível gerar as recorrências.',
+      );
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function downloadAttachment(attachment: Attachment) {
+    try {
+      if (isLocalPreview) {
+        const record = await getLocalAttachment(attachment.id);
+        if (!record) throw new Error('O arquivo local não foi encontrado.');
+        downloadBlob(record.blob, record.fileName);
+        return;
+      }
+      const response = await fetch(
+        `/api/attachments?id=${encodeURIComponent(attachment.id)}`,
+        { cache: 'no-store' },
+      );
+      if (!response.ok)
+        throw new Error('Não foi possível baixar o comprovante.');
+      downloadBlob(await response.blob(), attachment.fileName);
+    } catch (error) {
+      setNotice(
+        error instanceof Error
+          ? error.message
+          : 'Não foi possível baixar o comprovante.',
+      );
+    }
+  }
+
+  async function removeAttachment(attachment: Attachment) {
+    const confirmed = window.confirm(
+      `Excluir o comprovante “${attachment.fileName}”?`,
+    );
+    if (!confirmed) return;
+    try {
+      if (isLocalPreview) {
+        await deleteLocalAttachment(attachment.id);
+      } else {
+        const response = await fetch(
+          `/api/attachments?id=${encodeURIComponent(attachment.id)}`,
+          { method: 'DELETE' },
+        );
+        if (!response.ok) {
+          const payload = (await response.json()) as { error?: string };
+          throw new Error(payload.error ?? 'Não foi possível excluir.');
+        }
+      }
+      setData((current) => ({
+        ...current,
+        attachments: current.attachments.filter(
+          (item) => item.id !== attachment.id,
+        ),
+      }));
+      setNotice('Comprovante excluído.');
+    } catch (error) {
+      setNotice(
+        error instanceof Error
+          ? error.message
+          : 'Não foi possível excluir o comprovante.',
       );
     }
   }
@@ -955,300 +1534,356 @@ export function FinanceWorkspace({
   const firstName = displayName.split(' ')[0] || 'Olá';
 
   return (
-    <div className="min-h-screen bg-[#f3f7f5] text-[#102c2a]">
-      <a
-        href="#conteudo-principal"
-        className="sr-only z-[100] rounded-md bg-white px-4 py-2 focus:not-sr-only focus:fixed focus:left-4 focus:top-4"
-      >
-        Pular para o conteúdo
-      </a>
-
-      <aside className="fixed inset-y-0 left-0 z-40 hidden w-[252px] flex-col bg-[#071817] px-4 py-5 text-white lg:flex">
-        <Brand />
-        <nav className="mt-10 space-y-1" aria-label="Navegação principal">
-          {navItems.map((item) => (
-            <NavLink
-              key={item.view}
-              item={item}
-              active={activeView === item.view}
-            />
-          ))}
-        </nav>
-        <div className="mt-auto rounded-2xl border border-white/10 bg-white/[0.055] p-4">
-          <div className="mb-3 flex items-center gap-2 text-teal-200">
-            <ShieldCheck className="size-4" />
-            <span className="text-xs font-semibold uppercase tracking-[0.12em]">
-              Privado por padrão
-            </span>
-          </div>
-          <p className="text-xs leading-5 text-white/55">
-            Seus registros ficam associados à sua identidade e nunca são
-            misturados com os de outro usuário.
-          </p>
-        </div>
+    <CurrencyContext.Provider value={data.currency}>
+      <div className="min-h-screen overflow-x-hidden bg-[#f3f7f5] text-[#102c2a]">
         <a
-          href={chatGPTSignOutPath('/')}
-          className="mt-3 flex items-center gap-3 rounded-xl px-3 py-2.5 text-sm text-white/55 transition hover:bg-white/10 hover:text-white"
+          href="#conteudo-principal"
+          className="sr-only z-[100] rounded-md bg-white px-4 py-2 focus:not-sr-only focus:fixed focus:left-4 focus:top-4"
         >
-          <LogOut className="size-4" />
-          Sair
+          Pular para o conteúdo
         </a>
-      </aside>
 
-      <div className="lg:pl-[252px]">
-        <header className="sticky top-0 z-30 border-b border-[#dfe9e5] bg-[#f3f7f5]/92 px-4 py-3 backdrop-blur-xl sm:px-6 lg:px-8">
-          <div className="mx-auto flex max-w-[1500px] items-center justify-between gap-3">
-            <div className="flex items-center gap-3 lg:hidden">
-              <Button
-                variant="outline"
-                size="icon"
-                className="border-[#d5e3de] bg-white"
-                aria-label="Abrir menu"
-                onClick={() => setMobileOpen(true)}
-              >
-                <Menu />
-              </Button>
-              <Brand compact />
+        <aside className="fixed inset-y-0 left-0 z-40 hidden w-[252px] flex-col bg-[#071817] px-4 py-5 text-white lg:flex">
+          <Brand />
+          <nav className="mt-10 space-y-1" aria-label="Navegação principal">
+            {navItems.map((item) => (
+              <NavLink
+                key={item.view}
+                item={item}
+                active={activeView === item.view}
+              />
+            ))}
+          </nav>
+          <div className="mt-auto rounded-2xl border border-white/10 bg-white/[0.055] p-4">
+            <div className="mb-3 flex items-center gap-2 text-teal-200">
+              <ShieldCheck className="size-4" />
+              <span className="text-xs font-semibold uppercase tracking-[0.12em]">
+                Privado por padrão
+              </span>
             </div>
-            <div className="hidden min-w-0 lg:block">
-              <p className="text-xs font-semibold uppercase tracking-[0.17em] text-[#548078]">
-                {copy.eyebrow}
-              </p>
-            </div>
-            <div className="flex items-center gap-2 sm:gap-3">
-              {activeView !== 'settings' && (
-                <MonthPicker month={month} onChange={setMonth} />
-              )}
-              <Button
-                variant="outline"
-                size="icon"
-                className="hidden border-[#d5e3de] bg-white sm:inline-flex"
-                aria-label="Notificações"
-              >
-                <Bell />
-              </Button>
-              <div
-                className="flex size-10 items-center justify-center rounded-full bg-[#d8f7ed] text-sm font-bold text-[#0c6d61]"
-                title={displayName}
-              >
-                {firstName.slice(0, 2).toUpperCase()}
+            <p className="text-xs leading-5 text-white/55">
+              Seus registros ficam associados à sua identidade e nunca são
+              misturados com os de outro usuário.
+            </p>
+          </div>
+          <a
+            href={chatGPTSignOutPath('/')}
+            className="mt-3 flex items-center gap-3 rounded-xl px-3 py-2.5 text-sm text-white/55 transition hover:bg-white/10 hover:text-white"
+          >
+            <LogOut className="size-4" />
+            Sair
+          </a>
+        </aside>
+
+        <div className="lg:pl-[252px]">
+          <header className="sticky top-0 z-30 border-b border-[#dfe9e5] bg-[#f3f7f5]/92 px-4 py-3 backdrop-blur-xl sm:px-6 lg:px-8">
+            <div className="mx-auto flex max-w-[1500px] items-center justify-between gap-3">
+              <div className="flex items-center gap-3 lg:hidden">
+                <Button
+                  variant="outline"
+                  size="icon"
+                  className="border-[#d5e3de] bg-white"
+                  aria-label="Abrir menu"
+                  onClick={() => setMobileOpen(true)}
+                >
+                  <Menu />
+                </Button>
+                <Brand compact />
+              </div>
+              <div className="hidden min-w-0 lg:block">
+                <p className="text-xs font-semibold uppercase tracking-[0.17em] text-[#548078]">
+                  {copy.eyebrow}
+                </p>
+              </div>
+              <div className="flex min-w-0 items-center gap-2 sm:gap-3">
+                {isLocalPreview && (
+                  <Badge className="hidden gap-1 border border-teal-200 bg-teal-50 text-[#087667] sm:inline-flex">
+                    <MonitorCog className="size-3.5" />
+                    Ambiente local
+                  </Badge>
+                )}
+                {activeView !== 'settings' && (
+                  <MonthPicker month={month} onChange={setMonth} />
+                )}
+                <Button
+                  variant="outline"
+                  size="icon"
+                  className="hidden border-[#d5e3de] bg-white sm:inline-flex"
+                  aria-label="Notificações"
+                >
+                  <Bell />
+                </Button>
+                <div
+                  className="hidden size-10 items-center justify-center rounded-full bg-[#d8f7ed] text-sm font-bold text-[#0c6d61] sm:flex"
+                  title={displayName}
+                >
+                  {firstName.slice(0, 2).toUpperCase()}
+                </div>
               </div>
             </div>
-          </div>
-        </header>
+          </header>
 
-        <main
-          id="conteudo-principal"
-          className="mx-auto max-w-[1500px] px-4 pb-28 pt-7 sm:px-6 lg:px-8 lg:pb-12 lg:pt-9"
-        >
-          <div className="mb-7 flex flex-col justify-between gap-5 sm:flex-row sm:items-end">
-            <div>
-              <p className="mb-2 text-sm font-semibold text-[#0c8b7a]">
-                Olá, {firstName}
-              </p>
-              <h1 className="text-3xl font-semibold tracking-[-0.045em] text-[#0a2523] sm:text-4xl">
-                {copy.title}
-              </h1>
-              <p className="mt-2 max-w-2xl text-sm leading-6 text-[#607772] sm:text-base">
-                {copy.description}
-              </p>
+          <main
+            id="conteudo-principal"
+            className="mx-auto max-w-[1500px] px-4 pb-28 pt-7 sm:px-6 lg:px-8 lg:pb-12 lg:pt-9"
+          >
+            <div className="mb-7 flex flex-col justify-between gap-5 sm:flex-row sm:items-end">
+              <div>
+                <div className="mb-2 flex flex-wrap items-center gap-2">
+                  <p className="text-sm font-semibold text-[#0c8b7a]">
+                    Olá, {firstName}
+                  </p>
+                  {isLocalPreview && (
+                    <Badge className="gap-1 border border-teal-200 bg-teal-50 text-[#087667] sm:hidden">
+                      <MonitorCog className="size-3.5" /> Ambiente local
+                    </Badge>
+                  )}
+                </div>
+                <h1 className="text-3xl font-semibold tracking-[-0.045em] text-[#0a2523] sm:text-4xl">
+                  {copy.title}
+                </h1>
+                <p className="mt-2 max-w-2xl text-sm leading-6 text-[#607772] sm:text-base">
+                  {copy.description}
+                </p>
+              </div>
+              {(activeView === 'dashboard' ||
+                activeView === 'transactions') && (
+                <Button
+                  onClick={() => openNewTransaction()}
+                  className="h-11 rounded-xl bg-[#0b7f71] px-5 font-semibold text-white shadow-[0_10px_30px_rgba(11,127,113,.2)] hover:bg-[#096b60]"
+                >
+                  <Plus />
+                  Novo lançamento
+                </Button>
+              )}
             </div>
-            {(activeView === 'dashboard' || activeView === 'transactions') && (
-              <Button
-                onClick={() => openNewTransaction()}
-                className="h-11 rounded-xl bg-[#0b7f71] px-5 font-semibold text-white shadow-[0_10px_30px_rgba(11,127,113,.2)] hover:bg-[#096b60]"
-              >
-                <Plus />
-                Novo lançamento
-              </Button>
+
+            {loading ? (
+              <LoadingState />
+            ) : (
+              <>
+                {activeView === 'dashboard' && (
+                  <DashboardView
+                    data={data}
+                    month={month}
+                    onNew={openNewTransaction}
+                  />
+                )}
+                {activeView === 'transactions' && (
+                  <TransactionsView
+                    data={data}
+                    month={month}
+                    onEdit={openEditTransaction}
+                    onDelete={setDeleteTarget}
+                    onToggle={toggleStatus}
+                    onExport={() => exportCsv(data)}
+                    onImport={() => fileInputRef.current?.click()}
+                  />
+                )}
+                {activeView === 'planning' && (
+                  <PlanningView
+                    data={data}
+                    month={month}
+                    saving={saving}
+                    onSaveCard={saveCreditCard}
+                    onCloseStatement={closeCardStatement}
+                    onPayStatement={payCardStatement}
+                    onToggleRecurrence={toggleRecurrence}
+                    onGenerateRecurrences={generateRecurrences}
+                  />
+                )}
+                {activeView === 'budgets' && (
+                  <BudgetsView
+                    data={data}
+                    month={month}
+                    onNew={() => setBudgetOpen(true)}
+                  />
+                )}
+                {activeView === 'goals' && (
+                  <GoalsView
+                    data={data}
+                    onNew={() => setGoalOpen(true)}
+                    onSave={saveGoal}
+                  />
+                )}
+                {activeView === 'reports' && (
+                  <ReportsView data={data} month={month} />
+                )}
+                {activeView === 'settings' && (
+                  <SettingsView
+                    data={data}
+                    saving={saving}
+                    onNewCategory={() => setCategoryOpen(true)}
+                    onExport={() => exportCsv(data)}
+                    onImport={() => fileInputRef.current?.click()}
+                    onCurrencyChange={changeCurrency}
+                  />
+                )}
+              </>
             )}
-          </div>
-
-          {loading ? (
-            <LoadingState />
-          ) : (
-            <>
-              {activeView === 'dashboard' && (
-                <DashboardView
-                  data={data}
-                  month={month}
-                  onNew={openNewTransaction}
-                />
-              )}
-              {activeView === 'transactions' && (
-                <TransactionsView
-                  data={data}
-                  month={month}
-                  onEdit={openEditTransaction}
-                  onDelete={setDeleteTarget}
-                  onToggle={toggleStatus}
-                  onExport={() => exportCsv(data)}
-                  onImport={() => fileInputRef.current?.click()}
-                />
-              )}
-              {activeView === 'budgets' && (
-                <BudgetsView
-                  data={data}
-                  month={month}
-                  onNew={() => setBudgetOpen(true)}
-                />
-              )}
-              {activeView === 'goals' && (
-                <GoalsView
-                  data={data}
-                  onNew={() => setGoalOpen(true)}
-                  onSave={saveGoal}
-                />
-              )}
-              {activeView === 'reports' && (
-                <ReportsView data={data} month={month} />
-              )}
-              {activeView === 'settings' && (
-                <SettingsView
-                  data={data}
-                  onNewCategory={() => setCategoryOpen(true)}
-                  onExport={() => exportCsv(data)}
-                  onImport={() => fileInputRef.current?.click()}
-                />
-              )}
-            </>
-          )}
-        </main>
-      </div>
-
-      {mobileOpen && (
-        <div className="fixed inset-0 z-50 lg:hidden">
-          <button
-            className="absolute inset-0 bg-[#071817]/50 backdrop-blur-sm"
-            aria-label="Fechar menu"
-            onClick={() => setMobileOpen(false)}
-          />
-          <aside className="relative flex h-full w-[min(86vw,330px)] flex-col bg-[#071817] p-5 text-white shadow-2xl">
-            <div className="flex items-center justify-between">
-              <Brand />
-              <Button
-                variant="ghost"
-                size="icon"
-                aria-label="Fechar menu"
-                onClick={() => setMobileOpen(false)}
-              >
-                <X />
-              </Button>
-            </div>
-            <nav className="mt-9 space-y-1" aria-label="Navegação móvel">
-              {navItems.map((item) => (
-                <NavLink
-                  key={item.view}
-                  item={item}
-                  active={activeView === item.view}
-                />
-              ))}
-            </nav>
-          </aside>
+          </main>
         </div>
-      )}
 
-      <nav
-        className="fixed inset-x-3 bottom-3 z-40 grid grid-cols-5 rounded-2xl border border-white/70 bg-[#071817]/95 p-1.5 text-white shadow-2xl backdrop-blur-xl lg:hidden"
-        aria-label="Atalhos"
-      >
-        {navItems.slice(0, 5).map((item) => {
-          const Icon = item.icon;
-          const active = activeView === item.view;
-          return (
-            <Link
-              key={item.view}
-              href={item.href}
-              className={`flex min-h-12 flex-col items-center justify-center gap-0.5 rounded-xl text-[10px] transition ${active ? 'bg-teal-300 text-[#071817]' : 'text-white/55 hover:text-white'}`}
-            >
-              <Icon className="size-4" />
-              {item.label.split(' ')[0]}
-            </Link>
-          );
-        })}
-      </nav>
+        {mobileOpen && (
+          <div className="fixed inset-0 z-50 lg:hidden">
+            <button
+              className="absolute inset-0 bg-[#071817]/50 backdrop-blur-sm"
+              aria-label="Fechar menu"
+              onClick={() => setMobileOpen(false)}
+            />
+            <aside className="relative flex h-full w-[min(86vw,330px)] flex-col bg-[#071817] p-5 text-white shadow-2xl">
+              <div className="flex items-center justify-between">
+                <Brand />
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  aria-label="Fechar menu"
+                  onClick={() => setMobileOpen(false)}
+                >
+                  <X />
+                </Button>
+              </div>
+              <nav className="mt-9 space-y-1" aria-label="Navegação móvel">
+                {navItems.map((item) => (
+                  <NavLink
+                    key={item.view}
+                    item={item}
+                    active={activeView === item.view}
+                  />
+                ))}
+              </nav>
+            </aside>
+          </div>
+        )}
 
-      <input
-        ref={fileInputRef}
-        type="file"
-        accept=".csv,text/csv"
-        className="sr-only"
-        aria-label="Selecionar arquivo CSV"
-        onChange={(event) => {
-          const file = event.target.files?.[0];
-          if (file) void readImport(file);
-        }}
-      />
-
-      <TransactionDialog
-        open={transactionOpen}
-        onOpenChange={setTransactionOpen}
-        draft={transactionDraft}
-        setDraft={setTransactionDraft}
-        data={data}
-        saving={saving}
-        onSubmit={saveTransaction}
-      />
-      <BudgetDialog
-        open={budgetOpen}
-        onOpenChange={setBudgetOpen}
-        data={data}
-        month={month}
-        saving={saving}
-        onSave={saveBudget}
-      />
-      <GoalDialog
-        open={goalOpen}
-        onOpenChange={setGoalOpen}
-        saving={saving}
-        onSave={saveGoal}
-      />
-      <CategoryDialog
-        open={categoryOpen}
-        onOpenChange={setCategoryOpen}
-        saving={saving}
-        onSave={saveCategory}
-      />
-      <ImportDialog
-        preview={importPreview}
-        onClose={() => setImportPreview(null)}
-        onConfirm={confirmImport}
-        saving={saving}
-      />
-
-      <AlertDialog
-        open={Boolean(deleteTarget)}
-        onOpenChange={(open) => !open && setDeleteTarget(null)}
-      >
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>Excluir este lançamento?</AlertDialogTitle>
-            <AlertDialogDescription>
-              “{deleteTarget?.title}” será removido do histórico e dos
-              relatórios. Esta ação não pode ser desfeita.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel>Cancelar</AlertDialogCancel>
-            <AlertDialogAction
-              className="bg-rose-600 text-white hover:bg-rose-700"
-              onClick={() => void deleteTransaction()}
-            >
-              Excluir
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
-
-      {notice && (
-        <output
-          className="fixed bottom-24 right-4 z-[70] max-w-sm rounded-xl bg-[#0a2523] px-4 py-3 text-sm font-medium text-white shadow-2xl lg:bottom-6"
-          aria-live="polite"
+        <nav
+          className="fixed inset-x-3 bottom-3 z-40 grid grid-cols-5 rounded-2xl border border-white/70 bg-[#071817]/95 p-1.5 text-white shadow-2xl backdrop-blur-xl lg:hidden"
+          aria-label="Atalhos"
         >
-          {notice}
-        </output>
-      )}
-    </div>
+          {navItems
+            .filter((item) =>
+              ['dashboard', 'transactions', 'planning', 'budgets'].includes(
+                item.view,
+              ),
+            )
+            .map((item) => {
+              const Icon = item.icon;
+              const active = activeView === item.view;
+              return (
+                <Link
+                  key={item.view}
+                  href={item.href}
+                  className={`flex min-h-12 flex-col items-center justify-center gap-0.5 rounded-xl text-[10px] transition ${active ? 'bg-teal-300 text-[#071817]' : 'text-white/55 hover:text-white'}`}
+                >
+                  <Icon className="size-4" />
+                  {mobileNavLabels[item.view] ?? item.label.split(' ')[0]}
+                </Link>
+              );
+            })}
+          <button
+            type="button"
+            onClick={() => setMobileOpen(true)}
+            className={`flex min-h-12 flex-col items-center justify-center gap-0.5 rounded-xl text-[10px] transition ${['goals', 'reports', 'settings'].includes(activeView) ? 'bg-teal-300 text-[#071817]' : 'text-white/55 hover:text-white'}`}
+          >
+            <MoreHorizontal className="size-4" />
+            Mais
+          </button>
+        </nav>
+
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept=".csv,.xlsx,text/csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+          className="sr-only"
+          aria-label="Selecionar arquivo CSV ou XLSX"
+          onChange={(event) => {
+            const file = event.target.files?.[0];
+            if (file) void readImport(file);
+          }}
+        />
+
+        <TransactionDialog
+          open={transactionOpen}
+          onOpenChange={setTransactionOpen}
+          draft={transactionDraft}
+          setDraft={setTransactionDraft}
+          data={data}
+          saving={saving}
+          onSubmit={saveTransaction}
+          pendingFiles={pendingFiles}
+          onPendingFilesChange={setPendingFiles}
+          existingAttachments={data.attachments.filter(
+            (item) => item.transactionId === transactionDraft.id,
+          )}
+          onDownloadAttachment={downloadAttachment}
+          onDeleteAttachment={removeAttachment}
+          onAttachmentError={setNotice}
+        />
+        <BudgetDialog
+          open={budgetOpen}
+          onOpenChange={setBudgetOpen}
+          data={data}
+          month={month}
+          saving={saving}
+          onSave={saveBudget}
+        />
+        <GoalDialog
+          open={goalOpen}
+          onOpenChange={setGoalOpen}
+          saving={saving}
+          onSave={saveGoal}
+        />
+        <CategoryDialog
+          open={categoryOpen}
+          onOpenChange={setCategoryOpen}
+          saving={saving}
+          onSave={saveCategory}
+        />
+        <ImportDialog
+          preview={importPreview}
+          onClose={() => {
+            setImportPreview(null);
+            setImportSource(null);
+          }}
+          onConfirm={confirmImport}
+          onSelectSheet={selectImportSheet}
+          saving={saving}
+        />
+
+        <AlertDialog
+          open={Boolean(deleteTarget)}
+          onOpenChange={(open) => !open && setDeleteTarget(null)}
+        >
+          <AlertDialogContent>
+            <AlertDialogHeader>
+              <AlertDialogTitle>Excluir este lançamento?</AlertDialogTitle>
+              <AlertDialogDescription>
+                “{deleteTarget?.title}” será removido do histórico e dos
+                relatórios. Esta ação não pode ser desfeita.
+              </AlertDialogDescription>
+            </AlertDialogHeader>
+            <AlertDialogFooter>
+              <AlertDialogCancel>Cancelar</AlertDialogCancel>
+              <AlertDialogAction
+                className="bg-rose-600 text-white hover:bg-rose-700"
+                onClick={() => void deleteTransaction()}
+              >
+                Excluir
+              </AlertDialogAction>
+            </AlertDialogFooter>
+          </AlertDialogContent>
+        </AlertDialog>
+
+        {notice && (
+          <output
+            className="fixed bottom-24 right-4 z-[70] max-w-sm rounded-xl bg-[#0a2523] px-4 py-3 text-sm font-medium text-white shadow-2xl lg:bottom-6"
+            aria-live="polite"
+          >
+            {notice}
+          </output>
+        )}
+      </div>
+    </CurrencyContext.Provider>
   );
 }
 
@@ -1351,6 +1986,7 @@ function DashboardView({
   month: string;
   onNew: (kind?: TransactionKind) => void;
 }) {
+  const formatMoney = useMoneyFormatter();
   const monthRows = data.transactions.filter((item) =>
     item.date.startsWith(month),
   );
@@ -1853,9 +2489,9 @@ function TransactionsView({
             {rows.length} resultado(s) com os filtros atuais
           </CardDescription>
         </div>
-        <CardAction className="flex gap-2">
+        <CardAction className="col-span-full col-start-1 row-start-3 grid w-full grid-cols-2 gap-2 justify-self-stretch sm:col-start-2 sm:row-span-2 sm:row-start-1 sm:flex sm:w-auto sm:justify-self-end">
           <Button variant="outline" size="sm" onClick={onImport}>
-            <Upload /> Importar CSV
+            <Upload /> Importar CSV/XLSX
           </Button>
           <Button variant="outline" size="sm" onClick={onExport}>
             <Download /> Exportar
@@ -1979,6 +2615,7 @@ function TransactionRow({
   onDelete: (transaction: Transaction) => void;
   onToggle: (transaction: Transaction) => void;
 }) {
+  const formatMoney = useMoneyFormatter();
   const category = data.categories.find(
     (entry) => entry.id === item.categoryId,
   );
@@ -2078,6 +2715,7 @@ function TransactionMobileRow({
   onDelete: (transaction: Transaction) => void;
   onToggle: (transaction: Transaction) => void;
 }) {
+  const formatMoney = useMoneyFormatter();
   const category = data.categories.find(
     (entry) => entry.id === item.categoryId,
   );
@@ -2110,10 +2748,18 @@ function TransactionMobileRow({
             </div>
             <strong
               className={
-                item.kind === 'income' ? 'text-[#087f70]' : 'text-[#a94659]'
+                item.kind === 'income'
+                  ? 'text-[#087f70]'
+                  : item.kind === 'transfer'
+                    ? 'text-[#6d5fc4]'
+                    : 'text-[#a94659]'
               }
             >
-              {item.kind === 'income' ? '+' : '-'}
+              {item.kind === 'income'
+                ? '+'
+                : item.kind === 'transfer'
+                  ? ''
+                  : '-'}
               {formatMoney(item.amountCents)}
             </strong>
           </div>
@@ -2159,6 +2805,7 @@ function BudgetsView({
   month: string;
   onNew: () => void;
 }) {
+  const formatMoney = useMoneyFormatter();
   const budgets = data.budgets.filter((item) => item.month === month);
   const spentFor = (categoryId: string) =>
     data.transactions
@@ -2291,6 +2938,7 @@ function GoalsView({
   onNew: () => void;
   onSave: (goal: Goal) => Promise<void>;
 }) {
+  const formatMoney = useMoneyFormatter();
   const totalTarget = data.goals.reduce(
     (sum, item) => sum + item.targetCents,
     0,
@@ -2409,6 +3057,7 @@ function GoalsView({
 }
 
 function ReportsView({ data, month }: { data: FinanceData; month: string }) {
+  const formatMoney = useMoneyFormatter();
   const year = Number(month.slice(0, 4));
   const months = Array.from(
     { length: 12 },
@@ -2602,14 +3251,18 @@ function ReportsView({ data, month }: { data: FinanceData; month: string }) {
 
 function SettingsView({
   data,
+  saving,
   onNewCategory,
   onExport,
   onImport,
+  onCurrencyChange,
 }: {
   data: FinanceData;
+  saving: boolean;
   onNewCategory: () => void;
   onExport: () => void;
   onImport: () => void;
+  onCurrencyChange: (currency: CurrencyCode) => Promise<void>;
 }) {
   return (
     <div className="grid gap-5 xl:grid-cols-2">
@@ -2653,6 +3306,25 @@ function SettingsView({
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">
+          <div className="grid gap-2">
+            <Label htmlFor="base-currency">Moeda-base</Label>
+            <select
+              id="base-currency"
+              value={data.currency}
+              disabled={saving}
+              onChange={(event) =>
+                void onCurrencyChange(event.target.value as CurrencyCode)
+              }
+              className="h-11 rounded-xl border border-[#d5e3de] bg-white px-3 text-sm"
+            >
+              <option value="EUR">Euro (EUR)</option>
+              <option value="BRL">Real brasileiro (BRL)</option>
+            </select>
+            <p className="text-xs leading-5 text-[#718681]">
+              A troca altera a exibição e os novos cadastros. Valores existentes
+              não recebem conversão cambial automática.
+            </p>
+          </div>
           <div>
             <p className="mb-2 text-xs font-semibold uppercase tracking-[0.12em] text-[#718681]">
               Contas
@@ -2702,7 +3374,9 @@ function SettingsView({
             </div>
             <div className="rounded-xl bg-white/6 p-3">
               <p className="text-xs text-white/45">Moeda-base</p>
-              <p className="mt-1 font-semibold">Real brasileiro</p>
+              <p className="mt-1 font-semibold">
+                {data.currency === 'EUR' ? 'Euro' : 'Real brasileiro'}
+              </p>
             </div>
           </div>
         </CardContent>
@@ -2717,7 +3391,7 @@ function SettingsView({
         </CardHeader>
         <CardContent className="grid gap-3 sm:grid-cols-2">
           <Button variant="outline" className="h-12" onClick={onImport}>
-            <FileSpreadsheet /> Importar CSV
+            <FileSpreadsheet /> Importar CSV/XLSX
           </Button>
           <Button variant="outline" className="h-12" onClick={onExport}>
             <Download /> Exportar CSV
@@ -2736,6 +3410,12 @@ function TransactionDialog({
   data,
   saving,
   onSubmit,
+  pendingFiles,
+  onPendingFilesChange,
+  existingAttachments,
+  onDownloadAttachment,
+  onDeleteAttachment,
+  onAttachmentError,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
@@ -2744,10 +3424,19 @@ function TransactionDialog({
   data: FinanceData;
   saving: boolean;
   onSubmit: (event: React.SyntheticEvent<HTMLFormElement>) => void;
+  pendingFiles: File[];
+  onPendingFilesChange: (files: File[]) => void;
+  existingAttachments: Attachment[];
+  onDownloadAttachment: (attachment: Attachment) => Promise<void>;
+  onDeleteAttachment: (attachment: Attachment) => Promise<void>;
+  onAttachmentError: (message: string) => void;
 }) {
   const categories = data.categories.filter(
     (item) =>
       item.kind === (draft.kind === 'transfer' ? 'expense' : draft.kind),
+  );
+  const selectedAccount = data.accounts.find(
+    (item) => item.id === draft.accountId,
   );
   function update<K extends keyof TransactionDraft>(
     key: K,
@@ -2906,6 +3595,14 @@ function TransactionDialog({
               </div>
             )}
           </div>
+          {draft.kind !== 'transfer' && selectedAccount?.type === 'credit' && (
+            <div className="rounded-xl border border-[#bee2d9] bg-[#ecfaf6] px-4 py-3 text-xs leading-5 text-[#376a61]">
+              Esta despesa entrará em <strong>{selectedAccount.name}</strong>. O
+              ciclo será definido pela data da compra, com fechamento no dia{' '}
+              {selectedAccount.closingDay} e vencimento no dia{' '}
+              {selectedAccount.dueDay}.
+            </div>
+          )}
           <div className="grid gap-4 sm:grid-cols-2">
             <div className="grid gap-2">
               <Label htmlFor="transaction-responsible">
@@ -2928,6 +3625,62 @@ function TransactionDialog({
               />
             </div>
           </div>
+          {!draft.id && (
+            <div className="rounded-2xl border border-[#dfe9e5] bg-[#f7faf9] p-4">
+              <div className="grid gap-4 sm:grid-cols-2">
+                <div className="grid gap-2">
+                  <Label htmlFor="transaction-recurrence">
+                    Repetir lançamento
+                  </Label>
+                  <select
+                    id="transaction-recurrence"
+                    value={draft.recurrenceFrequency}
+                    onChange={(event) =>
+                      update(
+                        'recurrenceFrequency',
+                        event.target.value as '' | RecurrenceFrequency,
+                      )
+                    }
+                    className="h-9 rounded-lg border border-input bg-white px-2.5 text-sm"
+                  >
+                    <option value="">Não repetir</option>
+                    <option value="weekly">Semanal</option>
+                    <option value="monthly">Mensal</option>
+                    <option value="yearly">Anual</option>
+                  </select>
+                </div>
+                {draft.recurrenceFrequency && (
+                  <div className="grid gap-2">
+                    <Label htmlFor="transaction-recurrence-end">
+                      Término (opcional)
+                    </Label>
+                    <Input
+                      id="transaction-recurrence-end"
+                      type="date"
+                      min={draft.date}
+                      value={draft.recurrenceEndDate}
+                      onChange={(event) =>
+                        update('recurrenceEndDate', event.target.value)
+                      }
+                    />
+                  </div>
+                )}
+              </div>
+              <p className="mt-3 text-xs leading-5 text-[#718681]">
+                As próximas ocorrências só serão criadas quando você confirmar
+                em Planejamento; navegar entre meses não gera nada.
+              </p>
+            </div>
+          )}
+          <AttachmentComposer
+            existing={existingAttachments}
+            pendingFiles={pendingFiles}
+            onPendingFilesChange={onPendingFilesChange}
+            onDownload={onDownloadAttachment}
+            onDelete={onDeleteAttachment}
+            onError={onAttachmentError}
+            disabled={saving}
+          />
           <DialogFooter>
             <Button
               type="button"
@@ -3221,11 +3974,13 @@ function ImportDialog({
   preview,
   onClose,
   onConfirm,
+  onSelectSheet,
   saving,
 }: {
   preview: ImportPreview | null;
   onClose: () => void;
   onConfirm: () => Promise<void>;
+  onSelectSheet: (sheetIndex: number) => void;
   saving: boolean;
 }) {
   return (
@@ -3240,7 +3995,38 @@ function ImportDialog({
         {preview && (
           <div className="space-y-4">
             <div className="rounded-xl bg-[#f3f8f6] p-4">
-              <p className="truncate font-semibold">{preview.sourceName}</p>
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <p className="min-w-0 truncate font-semibold">
+                  {preview.sourceName}
+                </p>
+                <Badge className="bg-white text-[#526e69]">
+                  {preview.format.toUpperCase()}
+                </Badge>
+              </div>
+              {preview.sheetNames.length > 1 && (
+                <div className="mt-3 grid gap-2">
+                  <Label htmlFor="import-sheet">Aba da planilha</Label>
+                  <select
+                    id="import-sheet"
+                    value={preview.sheetIndex}
+                    onChange={(event) =>
+                      onSelectSheet(Number(event.target.value))
+                    }
+                    className="h-10 rounded-lg border border-[#d5e3de] bg-white px-3 text-sm"
+                  >
+                    {preview.sheetNames.map((name, index) => (
+                      <option key={`${name}-${index}`} value={index}>
+                        {name}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              )}
+              {preview.sheetNames.length === 1 && (
+                <p className="mt-2 text-xs text-[#718681]">
+                  Aba: {preview.sheetName}
+                </p>
+              )}
               <div className="mt-3 grid grid-cols-3 gap-2 text-center">
                 <div className="rounded-lg bg-white p-2">
                   <p className="text-xl font-semibold text-[#087f70]">
@@ -3262,10 +4048,16 @@ function ImportDialog({
                 </div>
               </div>
             </div>
+            {preview.missingColumns.length > 0 && (
+              <div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900">
+                Colunas não encontradas: {preview.missingColumns.join(', ')}.
+                Escolha outra aba ou ajuste o cabeçalho do arquivo.
+              </div>
+            )}
             <p className="text-xs leading-5 text-[#718681]">
               Formato esperado: data, grupo, descrição, valor, status e
-              categoria. Datas brasileiras e valores com vírgula são
-              reconhecidos.
+              categoria. CSV e Excel (.xlsx), datas brasileiras e valores com
+              vírgula são reconhecidos. Até 1.000 linhas são avaliadas por vez.
             </p>
           </div>
         )}
@@ -3274,7 +4066,11 @@ function ImportDialog({
             Cancelar
           </Button>
           <Button
-            disabled={saving || !preview?.rows.length}
+            disabled={
+              saving ||
+              !preview?.rows.length ||
+              Boolean(preview?.missingColumns.length)
+            }
             className="bg-[#0b7f71] text-white hover:bg-[#096b60]"
             onClick={() => void onConfirm()}
           >

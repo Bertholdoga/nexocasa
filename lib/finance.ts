@@ -1,5 +1,13 @@
+import {
+  advanceRecurrenceDate,
+  cardCycleForPurchase,
+  type RecurrenceFrequency,
+} from '@/lib/finance-rules';
+
 export type TransactionKind = 'income' | 'expense' | 'investment' | 'transfer';
 export type TransactionStatus = 'paid' | 'pending';
+export type CardStatementStatus = 'open' | 'closed' | 'paid';
+export type CurrencyCode = 'EUR' | 'BRL';
 
 export type Category = {
   id: string;
@@ -14,6 +22,10 @@ export type Account = {
   type: 'checking' | 'savings' | 'cash' | 'investment' | 'credit';
   openingBalanceCents: number;
   currency: string;
+  closingDay?: number | null;
+  dueDay?: number | null;
+  creditLimitCents?: number | null;
+  cardLastFour?: string | null;
 };
 
 export type PaymentMethod = {
@@ -34,6 +46,42 @@ export type Transaction = {
   destinationAccountId?: string | null;
   paymentMethodId?: string | null;
   responsible?: string | null;
+  recurrenceId?: string | null;
+  recurrenceOccurrenceDate?: string | null;
+  cardStatementId?: string | null;
+};
+
+export type RecurrenceRule = {
+  id: string;
+  sourceTransactionId: string;
+  frequency: RecurrenceFrequency;
+  interval: number;
+  anchorDate: string;
+  nextDate: string;
+  endDate?: string | null;
+  occurrenceStatus: TransactionStatus;
+  active: boolean;
+};
+
+export type CardStatement = {
+  id: string;
+  cardAccountId: string;
+  cycleStart: string;
+  cycleEnd: string;
+  dueDate: string;
+  status: CardStatementStatus;
+  closedTotalCents?: number | null;
+};
+
+export type Attachment = {
+  id: string;
+  transactionId: string;
+  fileName: string;
+  contentType: string;
+  sizeBytes: number;
+  kind: 'receipt' | 'audio' | 'other';
+  status: 'pending' | 'ready' | 'failed' | 'deleting';
+  createdAt?: string | null;
 };
 
 export type Budget = {
@@ -53,21 +101,29 @@ export type Goal = {
 };
 
 export type FinanceData = {
+  currency: CurrencyCode;
   transactions: Transaction[];
   categories: Category[];
   accounts: Account[];
   paymentMethods: PaymentMethod[];
   budgets: Budget[];
   goals: Goal[];
+  recurrenceRules: RecurrenceRule[];
+  cardStatements: CardStatement[];
+  attachments: Attachment[];
 };
 
 export const emptyFinanceData: FinanceData = {
+  currency: 'EUR',
   transactions: [],
   categories: [],
   accounts: [],
   paymentMethods: [],
   budgets: [],
   goals: [],
+  recurrenceRules: [],
+  cardStatements: [],
+  attachments: [],
 };
 
 const categorySeed: Category[] = [
@@ -92,14 +148,25 @@ const demoAccounts: Account[] = [
     name: 'Conta principal',
     type: 'checking',
     openingBalanceCents: 185000,
-    currency: 'BRL',
+    currency: 'EUR',
   },
   {
     id: 'acc-reserve',
     name: 'Reserva',
     type: 'investment',
     openingBalanceCents: 920000,
-    currency: 'BRL',
+    currency: 'EUR',
+  },
+  {
+    id: 'acc-card',
+    name: 'Cartão principal',
+    type: 'credit',
+    openingBalanceCents: 0,
+    currency: 'EUR',
+    closingDay: 10,
+    dueDay: 17,
+    creditLimitCents: 450000,
+    cardLastFour: '4242',
   },
 ];
 
@@ -225,7 +292,39 @@ export function makeDemoFinanceData(reference = new Date()): FinanceData {
     },
   );
 
+  for (const transaction of transactions) {
+    if (
+      transaction.kind !== 'expense' ||
+      transaction.paymentMethodId !== 'pay-card'
+    ) {
+      continue;
+    }
+    const cycle = cardCycleForPurchase(transaction.date, 10, 17);
+    transaction.accountId = 'acc-card';
+    transaction.cardStatementId = `demo-statement-${cycle.cycleEnd}`;
+  }
+
+  const statementMap = new Map<string, CardStatement>();
+  for (const transaction of transactions) {
+    if (!transaction.cardStatementId) continue;
+    const cycle = cardCycleForPurchase(transaction.date, 10, 17);
+    statementMap.set(transaction.cardStatementId, {
+      id: transaction.cardStatementId,
+      cardAccountId: 'acc-card',
+      cycleStart: cycle.cycleStart,
+      cycleEnd: cycle.cycleEnd,
+      dueDate: cycle.dueDate,
+      status:
+        cycle.cycleEnd < reference.toISOString().slice(0, 10) ? 'paid' : 'open',
+      closedTotalCents: null,
+    });
+  }
+
+  const recurrenceSourceId = `demo-home-${currentMonth}`;
+  const recurrenceSourceDate = isoDate(currentMonth, 8);
+
   return {
+    currency: 'EUR',
     transactions,
     categories: categorySeed,
     accounts: demoAccounts,
@@ -268,11 +367,31 @@ export function makeDemoFinanceData(reference = new Date()): FinanceData {
         color: '#f59e0b',
       },
     ],
+    recurrenceRules: [
+      {
+        id: 'demo-recurrence-home',
+        sourceTransactionId: recurrenceSourceId,
+        frequency: 'monthly',
+        interval: 1,
+        anchorDate: recurrenceSourceDate,
+        nextDate: advanceRecurrenceDate(
+          recurrenceSourceDate,
+          'monthly',
+          1,
+          recurrenceSourceDate,
+        ),
+        endDate: null,
+        occurrenceStatus: 'pending',
+        active: true,
+      },
+    ],
+    cardStatements: Array.from(statementMap.values()),
+    attachments: [],
   };
 }
 
-export function formatCurrency(cents: number, currency = 'BRL') {
-  return new Intl.NumberFormat('pt-BR', {
+export function formatCurrency(cents: number, currency: CurrencyCode = 'EUR') {
+  return new Intl.NumberFormat(currency === 'EUR' ? 'pt-PT' : 'pt-BR', {
     style: 'currency',
     currency,
   }).format(cents / 100);

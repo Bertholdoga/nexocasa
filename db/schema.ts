@@ -43,6 +43,10 @@ export const accounts = sqliteTable(
     openingBalanceCents: integer('opening_balance_cents').notNull().default(0),
     currency: text('currency').notNull().default('BRL'),
     archived: integer('archived', { mode: 'boolean' }).notNull().default(false),
+    closingDay: integer('closing_day'),
+    dueDay: integer('due_day'),
+    creditLimitCents: integer('credit_limit_cents'),
+    cardLastFour: text('card_last_four'),
     createdAt: text('created_at')
       .notNull()
       .default(sql`CURRENT_TIMESTAMP`),
@@ -91,6 +95,8 @@ export const transactions = sqliteTable(
     paymentMethodId: text('payment_method_id'),
     responsible: text('responsible'),
     recurrenceId: text('recurrence_id'),
+    recurrenceOccurrenceDate: text('recurrence_occurrence_date'),
+    cardStatementId: text('card_statement_id'),
     attachmentKey: text('attachment_key'),
     createdAt: text('created_at')
       .notNull()
@@ -110,6 +116,15 @@ export const transactions = sqliteTable(
       table.ownerId,
       table.categoryId,
       table.date,
+    ),
+    uniqueIndex('transactions_owner_recurrence_occurrence_unique').on(
+      table.ownerId,
+      table.recurrenceId,
+      table.recurrenceOccurrenceDate,
+    ),
+    index('transactions_owner_card_statement_idx').on(
+      table.ownerId,
+      table.cardStatementId,
     ),
   ],
 );
@@ -169,15 +184,58 @@ export const recurrenceRules = sqliteTable(
       enum: ['monthly', 'weekly', 'yearly'],
     }).notNull(),
     interval: integer('interval').notNull().default(1),
+    anchorDate: text('anchor_date'),
     nextDate: text('next_date').notNull(),
     endDate: text('end_date'),
+    occurrenceStatus: text('occurrence_status', {
+      enum: ['paid', 'pending'],
+    })
+      .notNull()
+      .default('pending'),
     active: integer('active', { mode: 'boolean' }).notNull().default(true),
     createdAt: text('created_at')
       .notNull()
       .default(sql`CURRENT_TIMESTAMP`),
+    updatedAt: text('updated_at'),
   },
   (table) => [
     index('recurrence_owner_next_idx').on(table.ownerId, table.nextDate),
+    uniqueIndex('recurrence_owner_source_unique').on(
+      table.ownerId,
+      table.sourceTransactionId,
+    ),
+  ],
+);
+
+export const cardStatements = sqliteTable(
+  'card_statements',
+  {
+    id: text('id').primaryKey(),
+    ownerId: text('owner_id').notNull(),
+    cardAccountId: text('card_account_id').notNull(),
+    cycleStart: text('cycle_start').notNull(),
+    cycleEnd: text('cycle_end').notNull(),
+    dueDate: text('due_date').notNull(),
+    status: text('status', { enum: ['open', 'closed', 'paid'] })
+      .notNull()
+      .default('open'),
+    closedTotalCents: integer('closed_total_cents'),
+    closedAt: text('closed_at'),
+    paidAt: text('paid_at'),
+    createdAt: text('created_at')
+      .notNull()
+      .default(sql`CURRENT_TIMESTAMP`),
+    updatedAt: text('updated_at')
+      .notNull()
+      .default(sql`CURRENT_TIMESTAMP`),
+  },
+  (table) => [
+    uniqueIndex('card_statements_owner_card_cycle_unique').on(
+      table.ownerId,
+      table.cardAccountId,
+      table.cycleEnd,
+    ),
+    index('card_statements_owner_due_idx').on(table.ownerId, table.dueDate),
   ],
 );
 
@@ -210,11 +268,24 @@ export const attachments = sqliteTable(
     fileName: text('file_name').notNull(),
     contentType: text('content_type').notNull(),
     sizeBytes: integer('size_bytes').notNull(),
+    kind: text('kind', { enum: ['receipt', 'audio', 'other'] })
+      .notNull()
+      .default('other'),
+    status: text('status', {
+      enum: ['pending', 'ready', 'failed', 'deleting'],
+    })
+      .notNull()
+      .default('ready'),
+    checksumSha256: text('checksum_sha256'),
+    durationSeconds: integer('duration_seconds'),
     createdAt: text('created_at')
       .notNull()
       .default(sql`CURRENT_TIMESTAMP`),
+    updatedAt: text('updated_at'),
+    deletedAt: text('deleted_at'),
   },
   (table) => [
+    uniqueIndex('attachments_object_key_unique').on(table.objectKey),
     index('attachments_owner_transaction_idx').on(
       table.ownerId,
       table.transactionId,
